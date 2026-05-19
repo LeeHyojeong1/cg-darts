@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import shutil
 import torchvision.transforms as transforms
-from torch.autograd import Variable
 
 
 class AvgrageMeter(object):
@@ -32,7 +31,7 @@ def accuracy(output, target, topk=(1,)):
 
   res = []
   for k in topk:
-    correct_k = correct[:k].view(-1).float().sum(0)
+    correct_k = correct[:k].reshape(-1).float().sum(0)
     res.append(correct_k.mul_(100.0/batch_size))
   return res
 
@@ -95,17 +94,24 @@ def save(model, model_path):
   torch.save(model.state_dict(), model_path)
 
 
-def load(model, model_path):
-  model.load_state_dict(torch.load(model_path))
+def load(model, model_path, device=None):
+  map_location = device if device is not None else None
+  model.load_state_dict(torch.load(model_path, map_location=map_location))
 
 
 def drop_path(x, drop_prob):
   if drop_prob > 0.:
     keep_prob = 1.-drop_prob
-    mask = Variable(torch.cuda.FloatTensor(x.size(0), 1, 1, 1).bernoulli_(keep_prob))
-    x.div_(keep_prob)
-    x.mul_(mask)
+    mask = x.new_empty(x.size(0), 1, 1, 1).bernoulli_(keep_prob)
+    x = x.div(keep_prob) * mask
   return x
+
+
+def get_device(gpu):
+  if torch.cuda.is_available() and gpu >= 0:
+    torch.cuda.set_device(gpu)
+    return torch.device('cuda:{}'.format(gpu))
+  return torch.device('cpu')
 
 
 def create_exp_dir(path, scripts_to_save=None):
@@ -118,4 +124,3 @@ def create_exp_dir(path, scripts_to_save=None):
     for script in scripts_to_save:
       dst_file = os.path.join(path, 'scripts', os.path.basename(script))
       shutil.copyfile(script, dst_file)
-

@@ -15,7 +15,6 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 
-from torch.autograd import Variable
 from model import NetworkImageNet as Network
 
 
@@ -73,32 +72,33 @@ class CrossEntropyLabelSmooth(nn.Module):
 
 
 def main():
-  if not torch.cuda.is_available():
-    logging.info('no gpu device available')
-    sys.exit(1)
-
   np.random.seed(args.seed)
-  torch.cuda.set_device(args.gpu)
-  cudnn.benchmark = True
   torch.manual_seed(args.seed)
-  cudnn.enabled=True
-  torch.cuda.manual_seed(args.seed)
-  logging.info('gpu device = %d' % args.gpu)
+  device = utils.get_device(args.gpu)
+  if device.type == 'cuda':
+    cudnn.benchmark = True
+    cudnn.enabled = True
+    torch.cuda.manual_seed(args.seed)
+    logging.info('gpu device = %d', args.gpu)
+  else:
+    cudnn.benchmark = False
+    logging.info('using cpu')
   logging.info("args = %s", args)
 
-  genotype = eval("genotypes.%s" % args.arch)
+  genotype = getattr(genotypes, args.arch)
   model = Network(args.init_channels, CLASSES, args.layers, args.auxiliary, genotype)
-  if args.parallel:
-    model = nn.DataParallel(model).cuda()
+  if args.parallel and device.type == 'cuda':
+    model = nn.DataParallel(model).to(device)
   else:
-    model = model.cuda()
+    model = model.to(device)
+  model.drop_path_prob = 0.0
 
   logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
 
   criterion = nn.CrossEntropyLoss()
-  criterion = criterion.cuda()
+  criterion = criterion.to(device)
   criterion_smooth = CrossEntropyLabelSmooth(CLASSES, args.label_smooth)
-  criterion_smooth = criterion_smooth.cuda()
+  criterion_smooth = criterion_smooth.to(device)
 
   optimizer = torch.optim.SGD(
     model.parameters(),
@@ -142,14 +142,16 @@ def main():
 
   best_acc_top1 = 0
   for epoch in range(args.epochs):
-    scheduler.step()
-    logging.info('epoch %d lr %e', epoch, scheduler.get_lr()[0])
-    model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+    logging.info('epoch %d lr %e', epoch, scheduler.get_last_lr()[0])
+    if isinstance(model, nn.DataParallel):
+      model.module.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+    else:
+      model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
 
-    train_acc, train_obj = train(train_queue, model, criterion_smooth, optimizer)
+    train_acc, train_obj = train(train_queue, model, criterion_smooth, optimizer, device)
     logging.info('train_acc %f', train_acc)
 
-    valid_acc_top1, valid_acc_top5, valid_obj = infer(valid_queue, model, criterion)
+    valid_acc_top1, valid_acc_top5, valid_obj = infer(valid_queue, model, criterion, device)
     logging.info('valid_acc_top1 %f', valid_acc_top1)
     logging.info('valid_acc_top5 %f', valid_acc_top5)
 
@@ -164,19 +166,18 @@ def main():
       'best_acc_top1': best_acc_top1,
       'optimizer' : optimizer.state_dict(),
       }, is_best, args.save)
+    scheduler.step()
 
 
-def train(train_queue, model, criterion, optimizer):
+def train(train_queue, model, criterion, optimizer, device):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
   model.train()
 
   for step, (input, target) in enumerate(train_queue):
-    target = target.cuda(async=True)
-    input = input.cuda()
-    input = Variable(input)
-    target = Variable(target)
+    input = input.to(device, non_blocking=(device.type == 'cuda'))
+    target = target.to(device, non_blocking=(device.type == 'cuda'))
 
     optimizer.zero_grad()
     logits, logits_aux = model(input)
@@ -186,14 +187,14 @@ def train(train_queue, model, criterion, optimizer):
       loss += args.auxiliary_weight*loss_aux
 
     loss.backward()
-    nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
+    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
     optimizer.step()
 
     prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
     n = input.size(0)
-    objs.update(loss.data[0], n)
-    top1.update(prec1.data[0], n)
-    top5.update(prec5.data[0], n)
+    objs.update(loss.item(), n)
+    top1.update(prec1.item(), n)
+    top5.update(prec5.item(), n)
 
     if step % args.report_freq == 0:
       logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
@@ -201,27 +202,28 @@ def train(train_queue, model, criterion, optimizer):
   return top1.avg, objs.avg
 
 
-def infer(valid_queue, model, criterion):
+def infer(valid_queue, model, criterion, device):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
   model.eval()
 
-  for step, (input, target) in enumerate(valid_queue):
-    input = Variable(input, volatile=True).cuda()
-    target = Variable(target, volatile=True).cuda(async=True)
+  with torch.no_grad():
+    for step, (input, target) in enumerate(valid_queue):
+      input = input.to(device, non_blocking=(device.type == 'cuda'))
+      target = target.to(device, non_blocking=(device.type == 'cuda'))
 
-    logits, _ = model(input)
-    loss = criterion(logits, target)
+      logits, _ = model(input)
+      loss = criterion(logits, target)
 
-    prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-    n = input.size(0)
-    objs.update(loss.data[0], n)
-    top1.update(prec1.data[0], n)
-    top5.update(prec5.data[0], n)
+      prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+      n = input.size(0)
+      objs.update(loss.item(), n)
+      top1.update(prec1.item(), n)
+      top5.update(prec5.item(), n)
 
-    if step % args.report_freq == 0:
-      logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+      if step % args.report_freq == 0:
+        logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
 
   return top1.avg, top5.avg, objs.avg
 

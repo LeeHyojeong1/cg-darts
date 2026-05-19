@@ -15,7 +15,7 @@ import gc
 import data
 import model_search as model
 
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
+from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint, safe_torch_load
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 Language Model')
 parser.add_argument('--data', type=str, default='../data/penn/',
@@ -80,6 +80,12 @@ parser.add_argument('--arch_lr', type=float, default=3e-3,
                     help='learning rate for the architecture encoding alpha')
 args = parser.parse_args()
 
+
+def save_genotype(genotype, save_dir):
+    with open(os.path.join(save_dir, 'genotype.txt'), 'w') as f:
+        f.write(repr(genotype))
+        f.write('\n')
+
 if args.nhidlast < 0:
     args.nhidlast = args.emsize
 if args.small_batch_size < 0:
@@ -99,14 +105,13 @@ logging.getLogger().addHandler(fh)
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    if not args.cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-    else:
-        torch.cuda.set_device(args.gpu)
-        cudnn.benchmark = True
-        cudnn.enabled=True
-        torch.cuda.manual_seed_all(args.seed)
+args.cuda = args.cuda and torch.cuda.is_available() and args.gpu >= 0
+device = torch.device('cuda:{}'.format(args.gpu) if args.cuda else 'cpu')
+if args.cuda:
+    torch.cuda.set_device(args.gpu)
+    cudnn.benchmark = True
+    cudnn.enabled = True
+    torch.cuda.manual_seed_all(args.seed)
 
 corpus = data.Corpus(args.data)
 
@@ -121,26 +126,29 @@ test_data = batchify(corpus.test, test_batch_size, args)
 
 ntokens = len(corpus.dictionary)
 if args.continue_train:
-    model = torch.load(os.path.join(args.save, 'model.pt'))
+    model = safe_torch_load(os.path.join(args.save, 'model.pt'), map_location=device)
 else:
     model = model.RNNModelSearch(ntokens, args.emsize, args.nhid, args.nhidlast, 
                        args.dropout, args.dropouth, args.dropoutx, args.dropouti, args.dropoute)
+model = model.to(device)
 
 size = 0
 for p in model.parameters():
     size += p.nelement()
 logging.info('param size: {}'.format(size))
 logging.info('initial genotype:')
-logging.info(model.genotype())
+initial_genotype = model.genotype()
+logging.info(initial_genotype)
+save_genotype(initial_genotype, args.save)
 
 if args.cuda:
     if args.single_gpu:
-        parallel_model = model.cuda()
+        parallel_model = model
     else:
-        parallel_model = nn.DataParallel(model, dim=1).cuda()
+        parallel_model = nn.DataParallel(model, dim=1).to(device)
 else:
     parallel_model = model
-architect = Architect(parallel_model, args)
+architect = Architect(model, args)
 
 total_params = sum(x.data.nelement() for x in model.parameters())
 logging.info('Args: {}'.format(args))
@@ -153,24 +161,25 @@ def evaluate(data_source, batch_size=10):
     total_loss = 0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
+    with torch.no_grad():
+      for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, args, evaluation=True)
-        targets = targets.view(-1)
+        targets = targets.reshape(-1)
 
         log_prob, hidden = parallel_model(data, hidden)
-        loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
+        loss = nn.functional.nll_loss(log_prob.reshape(-1, log_prob.size(2)), targets)
 
-        total_loss += loss * len(data)
+        total_loss += loss.item() * len(data)
 
         hidden = repackage_hidden(hidden)
-    return total_loss[0] / len(data_source)
+    return total_loss / len(data_source)
 
 
 def train():
     assert args.batch_size % args.small_batch_size == 0, 'batch_size must be divisible by small_batch_size'
 
     # Turn on training mode which enables dropout.
-    total_loss = 0
+    total_loss = 0.0
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     hidden = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
@@ -195,8 +204,8 @@ def train():
 
         start, end, s_id = 0, args.small_batch_size, 0
         while start < args.batch_size:
-            cur_data, cur_targets = data[:, start: end], targets[:, start: end].contiguous().view(-1)
-            cur_data_valid, cur_targets_valid = data_valid[:, start: end], targets_valid[:, start: end].contiguous().view(-1)
+            cur_data, cur_targets = data[:, start: end], targets[:, start: end].contiguous().reshape(-1)
+            cur_data_valid, cur_targets_valid = data_valid[:, start: end], targets_valid[:, start: end].contiguous().reshape(-1)
 
             # Starting each batch, we detach the hidden state from how it was previously produced.
             # If we didn't, the model would try backpropagating all the way to start of the dataset.
@@ -214,7 +223,7 @@ def train():
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
             log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
-            raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
+            raw_loss = nn.functional.nll_loss(log_prob.reshape(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss
             # Activiation Regularization
@@ -223,7 +232,7 @@ def train():
             # Temporal Activation Regularization (slowness)
             loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
             loss *= args.small_batch_size / args.batch_size
-            total_loss += raw_loss.data * args.small_batch_size / args.batch_size
+            total_loss += raw_loss.item() * args.small_batch_size / args.batch_size
             loss.backward()
 
             s_id += 1
@@ -233,15 +242,17 @@ def train():
             gc.collect()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs.
-        torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
+        torch.nn.utils.clip_grad_norm_(model.weight_parameters(), args.clip)
         optimizer.step()
 
         # total_loss += raw_loss.data
         optimizer.param_groups[0]['lr'] = lr2
         if batch % args.log_interval == 0 and batch > 0:
-            logging.info(parallel_model.genotype())
-            print(F.softmax(parallel_model.weights, dim=-1))
-            cur_loss = total_loss[0] / args.log_interval
+            genotype = model.genotype()
+            logging.info(genotype)
+            save_genotype(genotype, args.save)
+            print(F.softmax(model.weights, dim=-1))
+            cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             logging.info('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
@@ -258,14 +269,14 @@ best_val_loss = []
 stored_loss = 100000000
 
 if args.continue_train:
-    optimizer_state = torch.load(os.path.join(args.save, 'optimizer.pt'))
+    optimizer_state = safe_torch_load(os.path.join(args.save, 'optimizer.pt'), map_location=device)
     if 't0' in optimizer_state['param_groups'][0]:
-        optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+        optimizer = torch.optim.ASGD(model.weight_parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        optimizer = torch.optim.SGD(model.weight_parameters(), lr=args.lr, weight_decay=args.wdecay)
     optimizer.load_state_dict(optimizer_state)
 else:
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wdecay)
+    optimizer = torch.optim.SGD(model.weight_parameters(), lr=args.lr, weight_decay=args.wdecay)
 
 for epoch in range(1, args.epochs+1):
     epoch_start_time = time.time()
@@ -282,5 +293,6 @@ for epoch in range(1, args.epochs+1):
         save_checkpoint(model, optimizer, epoch, args.save)
         logging.info('Saving Normal!')
         stored_loss = val_loss
+        save_genotype(model.genotype(), args.save)
 
     best_val_loss.append(val_loss)

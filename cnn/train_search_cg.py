@@ -14,7 +14,8 @@ import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
 
 from model_search import Network
-from architect import Architect
+from architect_cg import ArchitectCG
+from cost_utils import build_search_costs
 
 
 parser = argparse.ArgumentParser("cifar")
@@ -44,9 +45,19 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
+parser.add_argument('--cost_metric', type=str, default='flops', choices=['flops', 'params'],
+                    help='differentiable architecture cost metric')
+parser.add_argument('--cost_lambda', type=float, default=0.0,
+                    help='weight for the architecture cost regularizer')
+parser.add_argument('--cost_warmup_epochs', type=int, default=0,
+                    help='linearly warm up cost_lambda over this many epochs')
+parser.add_argument('--cost_normalize', type=str, default='edge', choices=['edge', 'global', 'none'],
+                    help='normalization mode for operation costs')
+parser.add_argument('--cost_input_size', type=int, default=32,
+                    help='input image size used for FLOPs lookup construction')
 args = parser.parse_args()
 
-args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
+args.save = 'search-cg-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
 utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
 
 log_format = '%(asctime)s %(message)s'
@@ -64,6 +75,22 @@ def save_genotype(genotype, save_dir):
   with open(os.path.join(save_dir, 'genotype.txt'), 'w') as f:
     f.write(repr(genotype))
     f.write('\n')
+
+
+def scheduled_lambda(epoch):
+  if args.cost_warmup_epochs <= 0:
+    return args.cost_lambda
+  scale = min(1.0, float(epoch + 1) / float(args.cost_warmup_epochs))
+  return args.cost_lambda * scale
+
+
+def tensor_range(tensor):
+  return float(tensor.min()), float(tensor.max()), float(tensor.mean())
+
+
+def current_cost(architect):
+  with torch.no_grad():
+    return architect.cost_value().item()
 
 
 def main():
@@ -117,11 +144,28 @@ def main():
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
-  architect = Architect(model, args)
+  costs = build_search_costs(
+      args.init_channels, args.layers, steps=model._steps,
+      input_size=args.cost_input_size, metric=args.cost_metric,
+      normalize=args.cost_normalize)
+  logging.info('cost metric = %s normalize = %s lambda = %e warmup_epochs = %d',
+               args.cost_metric, args.cost_normalize, args.cost_lambda, args.cost_warmup_epochs)
+  logging.info('raw normal cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.normal_raw))
+  logging.info('raw reduce cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.reduce_raw))
+  logging.info('normalized normal cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.normal))
+  logging.info('normalized reduce cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.reduce))
+
+  architect = ArchitectCG(model, args, costs.normal, costs.reduce)
+  cost_log_path = os.path.join(args.save, 'cost_log.csv')
+  with open(cost_log_path, 'w') as f:
+    f.write('epoch,lambda,expected_cost,train_acc,train_obj,valid_acc,valid_obj\n')
 
   for epoch in range(args.epochs):
     lr = scheduler.get_last_lr()[0]
+    lambda_t = scheduled_lambda(epoch)
+    architect.set_cost_weight(lambda_t)
     logging.info('epoch %d lr %e', epoch, lr)
+    logging.info('cg lambda %e expected_%s %e', lambda_t, args.cost_metric, current_cost(architect))
 
     genotype = model.genotype()
     logging.info('genotype = %s', genotype)
@@ -137,6 +181,12 @@ def main():
     # validation
     valid_acc, valid_obj = infer(valid_queue, model, criterion, device)
     logging.info('valid_acc %f', valid_acc)
+
+    expected_cost = current_cost(architect)
+    logging.info('expected_%s %e', args.cost_metric, expected_cost)
+    with open(cost_log_path, 'a') as f:
+      f.write('{},{:.8e},{:.8e},{:.8f},{:.8e},{:.8f},{:.8e}\n'.format(
+        epoch, lambda_t, expected_cost, train_acc, train_obj, valid_acc, valid_obj))
 
     utils.save(model, os.path.join(args.save, 'weights.pt'))
     scheduler.step()
@@ -180,7 +230,7 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
     top5.update(prec5.item(), n)
 
     if step % args.report_freq == 0:
-      logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+      logging.info('train %03d %e %f %f cost %e', step, objs.avg, top1.avg, top5.avg, current_cost(architect))
 
   return top1.avg, objs.avg
 
@@ -212,4 +262,4 @@ def infer(valid_queue, model, criterion, device):
 
 
 if __name__ == '__main__':
-  main() 
+  main()

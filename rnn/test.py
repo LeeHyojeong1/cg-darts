@@ -10,7 +10,7 @@ import torch.backends.cudnn as cudnn
 import data
 import model
 
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
+from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint, safe_torch_load
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 Language Model')
 parser.add_argument('--data', type=str, default='../data/penn/',
@@ -70,14 +70,13 @@ def logging(s, print_=True, log_=True):
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    if not args.cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-    else:
-        torch.cuda.set_device(args.gpu)
-        cudnn.benchmark = True
-        cudnn.enabled=True
-        torch.cuda.manual_seed_all(args.seed)
+args.cuda = args.cuda and torch.cuda.is_available() and args.gpu >= 0
+device = torch.device('cuda:{}'.format(args.gpu) if args.cuda else 'cpu')
+if args.cuda:
+    torch.cuda.set_device(args.gpu)
+    cudnn.benchmark = True
+    cudnn.enabled = True
+    torch.cuda.manual_seed_all(args.seed)
 
 
 corpus = data.Corpus(args.data)
@@ -88,29 +87,30 @@ test_data = batchify(corpus.test, test_batch_size, args)
 def evaluate(data_source, batch_size=10):
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    total_loss = 0
+    total_loss = 0.0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
-        print(i, data_source.size(0)-1)
+    with torch.no_grad():
+      for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, args, evaluation=True)
-        targets = targets.view(-1)
+        targets = targets.reshape(-1)
 
         log_prob, hidden = parallel_model(data, hidden)
-        loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
+        loss = nn.functional.nll_loss(log_prob.reshape(-1, log_prob.size(2)), targets)
 
-        total_loss += loss * len(data)
+        total_loss += loss.item() * len(data)
 
         hidden = repackage_hidden(hidden)
-    return total_loss[0] / len(data_source)
+    return total_loss / len(data_source)
 
 # Load the best saved model.
-model = torch.load(args.model_path)
+model = safe_torch_load(args.model_path, map_location=device)
+model = model.to(device)
 
 total_params = sum(x.data.nelement() for x in model.parameters())
 logging('Args: {}'.format(args))
 logging('Model total parameters: {}'.format(total_params))
-parallel_model = model.cuda()
+parallel_model = model
 
 # Run on test data.
 test_loss = evaluate(test_data, test_batch_size)
@@ -118,4 +118,3 @@ logging('=' * 89)
 logging('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))
 logging('=' * 89)
-

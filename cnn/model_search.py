@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from operations import *
-from torch.autograd import Variable
 from genotypes import PRIMITIVES
 from genotypes import Genotype
 
@@ -68,11 +67,12 @@ class Network(nn.Module):
     self._criterion = criterion
     self._steps = steps
     self._multiplier = multiplier
+    self._stem_multiplier = stem_multiplier
 
     C_curr = stem_multiplier*C
     self.stem = nn.Sequential(
       nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
-      nn.BatchNorm2d(C_curr)
+      nn.BatchNorm2d(C_curr, affine=False)
     )
  
     C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
@@ -92,10 +92,15 @@ class Network(nn.Module):
     self.global_pooling = nn.AdaptiveAvgPool2d(1)
     self.classifier = nn.Linear(C_prev, num_classes)
 
+    self._use_batch_specific_bn_stats()
     self._initialize_alphas()
 
   def new(self):
-    model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()
+    device = next(self.parameters()).device
+    model_new = Network(
+      self._C, self._num_classes, self._layers, self._criterion,
+      self._steps, self._multiplier, self._stem_multiplier
+    ).to(device)
     for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
         x.data.copy_(y.data)
     return model_new
@@ -116,12 +121,20 @@ class Network(nn.Module):
     logits = self(input)
     return self._criterion(logits, target) 
 
+  def _use_batch_specific_bn_stats(self):
+    for module in self.modules():
+      if isinstance(module, nn.BatchNorm2d):
+        module.track_running_stats = False
+        module.running_mean = None
+        module.running_var = None
+        module.num_batches_tracked = None
+
   def _initialize_alphas(self):
     k = sum(1 for i in range(self._steps) for n in range(2+i))
     num_ops = len(PRIMITIVES)
 
-    self.alphas_normal = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
-    self.alphas_reduce = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
+    self.alphas_normal = nn.Parameter(torch.zeros(k, num_ops))
+    self.alphas_reduce = nn.Parameter(torch.zeros(k, num_ops))
     self._arch_parameters = [
       self.alphas_normal,
       self.alphas_reduce,
@@ -129,6 +142,15 @@ class Network(nn.Module):
 
   def arch_parameters(self):
     return self._arch_parameters
+
+  def named_weight_parameters(self):
+    arch_ids = {id(p) for p in self.arch_parameters()}
+    for name, param in self.named_parameters():
+      if id(param) not in arch_ids:
+        yield name, param
+
+  def weight_parameters(self):
+    return [param for _, param in self.named_weight_parameters()]
 
   def genotype(self):
 
@@ -160,4 +182,3 @@ class Network(nn.Module):
       reduce=gene_reduce, reduce_concat=concat
     )
     return genotype
-

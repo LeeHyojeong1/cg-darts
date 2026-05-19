@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from genotypes import PRIMITIVES, STEPS, CONCAT, Genotype
-from torch.autograd import Variable
 from collections import namedtuple
 from model import DARTSCell, RNNModel
 
@@ -12,6 +11,10 @@ class DARTSCellSearch(DARTSCell):
   def __init__(self, ninp, nhid, dropouth, dropoutx):
     super(DARTSCellSearch, self).__init__(ninp, nhid, dropouth, dropoutx, genotype=None)
     self.bn = nn.BatchNorm1d(nhid, affine=False)
+    self.bn.track_running_stats = False
+    self.bn.running_mean = None
+    self.bn.running_var = None
+    self.bn.num_batches_tracked = None
 
   def cell(self, x, h_prev, x_mask, h_mask):
     s0 = self._compute_init_state(x, h_prev, x_mask, h_mask)
@@ -51,21 +54,31 @@ class RNNModelSearch(RNNModel):
         self._initialize_arch_parameters()
 
     def new(self):
+        device = next(self.parameters()).device
         model_new = RNNModelSearch(*self._args)
+        model_new = model_new.to(device)
         for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
             x.data.copy_(y.data)
         return model_new
 
     def _initialize_arch_parameters(self):
       k = sum(i for i in range(1, STEPS+1))
-      weights_data = torch.randn(k, len(PRIMITIVES)).mul_(1e-3)
-      self.weights = Variable(weights_data.cuda(), requires_grad=True)
+      self.weights = nn.Parameter(torch.zeros(k, len(PRIMITIVES)))
       self._arch_parameters = [self.weights]
       for rnn in self.rnns:
         rnn.weights = self.weights
 
     def arch_parameters(self):
       return self._arch_parameters
+
+    def named_weight_parameters(self):
+      arch_ids = {id(p) for p in self.arch_parameters()}
+      for name, param in self.named_parameters():
+        if id(param) not in arch_ids:
+          yield name, param
+
+    def weight_parameters(self):
+      return [param for _, param in self.named_weight_parameters()]
 
     def _loss(self, hidden, input, target):
       log_prob, hidden_next = self(input, hidden, return_h=False)
@@ -93,4 +106,3 @@ class RNNModelSearch(RNNModel):
       gene = _parse(F.softmax(self.weights, dim=-1).data.cpu().numpy())
       genotype = Genotype(recurrent=gene, concat=range(STEPS+1)[-CONCAT:])
       return genotype
-

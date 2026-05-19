@@ -89,12 +89,11 @@ class SentCorpus(object):
         return sents
 
 class BatchSentLoader(object):
-    def __init__(self, sents, batch_size, pad_id=0, cuda=False, volatile=False):
+    def __init__(self, sents, batch_size, pad_id=0, cuda=False):
         self.sents = sents
         self.batch_size = batch_size
         self.sort_sents = sorted(sents, key=lambda x: x.size(0))
         self.cuda = cuda
-        self.volatile = volatile
         self.pad_id = pad_id
 
     def __next__(self):
@@ -109,7 +108,7 @@ class BatchSentLoader(object):
             s = batch[i]
             tensor[:s.size(0),i].copy_(s)
         if self.cuda:
-            tensor = tensor.cuda()
+            tensor = tensor.to('cuda')
 
         self.idx += batch_size
 

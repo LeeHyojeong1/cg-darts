@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from operations import *
-from torch.autograd import Variable
 from utils import drop_path
 
 
@@ -9,7 +8,6 @@ class Cell(nn.Module):
 
   def __init__(self, genotype, C_prev_prev, C_prev, C, reduction, reduction_prev):
     super(Cell, self).__init__()
-    print(C_prev_prev, C_prev, C)
 
     if reduction_prev:
       self.preprocess0 = FactorizedReduce(C_prev_prev, C)
@@ -211,4 +209,3 @@ class NetworkImageNet(nn.Module):
     out = self.global_pooling(s1)
     logits = self.classifier(out.view(out.size(0), -1))
     return logits, logits_aux
-

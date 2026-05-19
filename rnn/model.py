@@ -6,7 +6,6 @@ from genotypes import STEPS
 from utils import mask2d
 from utils import LockedDropout
 from utils import embedded_dropout
-from torch.autograd import Variable
 
 INITRANGE = 0.04
 
@@ -31,8 +30,8 @@ class DARTSCell(nn.Module):
     T, B = inputs.size(0), inputs.size(1)
 
     if self.training:
-      x_mask = mask2d(B, inputs.size(2), keep_prob=1.-self.dropoutx)
-      h_mask = mask2d(B, hidden.size(2), keep_prob=1.-self.dropouth)
+      x_mask = mask2d(B, inputs.size(2), keep_prob=1.-self.dropoutx, device=inputs.device)
+      h_mask = mask2d(B, hidden.size(2), keep_prob=1.-self.dropouth, device=hidden.device)
     else:
       x_mask = h_mask = None
 
@@ -57,11 +56,11 @@ class DARTSCell(nn.Module):
 
   def _get_activation(self, name):
     if name == 'tanh':
-      f = F.tanh
+      f = torch.tanh
     elif name == 'relu':
       f = F.relu
     elif name == 'sigmoid':
-      f = F.sigmoid
+      f = torch.sigmoid
     elif name == 'identity':
       f = lambda x: x
     else:
@@ -156,5 +155,4 @@ class RNNModel(nn.Module):
 
     def init_hidden(self, bsz):
       weight = next(self.parameters()).data
-      return [Variable(weight.new(1, bsz, self.nhid).zero_())]
-
+      return [weight.new_zeros(1, bsz, self.nhid)]

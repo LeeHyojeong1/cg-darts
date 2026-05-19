@@ -2,12 +2,13 @@ import torch
 import torch.nn as nn
 import os, shutil
 import numpy as np
-from torch.autograd import Variable
 
 
 def repackage_hidden(h):
-    if type(h) == Variable:
-        return Variable(h.data)
+    if torch.is_tensor(h):
+        return h.detach()
+    elif isinstance(h, list):
+        return [repackage_hidden(v) for v in h]
     else:
         return tuple(repackage_hidden(v) for v in h)
 
@@ -18,14 +19,14 @@ def batchify(data, bsz, args):
     data = data.view(bsz, -1).t().contiguous()
     print(data.size())
     if args.cuda:
-        data = data.cuda()
+        data = data.to(torch.device('cuda:{}'.format(args.gpu)))
     return data
 
 
 def get_batch(source, i, args, seq_len=None, evaluation=False):
     seq_len = min(seq_len if seq_len else args.bptt, len(source) - 1 - i)
-    data = Variable(source[i:i+seq_len], volatile=evaluation)
-    target = Variable(source[i+1:i+1+seq_len])
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len]
     return data, target
 
 
@@ -53,8 +54,8 @@ def save_checkpoint(model, optimizer, epoch, path, finetune=False):
 
 def embedded_dropout(embed, words, dropout=0.1, scale=None):
     if dropout:
-        mask = embed.weight.data.new().resize_((embed.weight.size(0), 1)).bernoulli_(1 - dropout).expand_as(embed.weight) / (1 - dropout)
-        mask = Variable(mask)
+        mask = embed.weight.new_empty((embed.weight.size(0), 1)).bernoulli_(1 - dropout)
+        mask = mask.expand_as(embed.weight) / (1 - dropout)
         masked_embed_weight = mask * embed.weight
     else:
         masked_embed_weight = embed.weight
@@ -64,10 +65,9 @@ def embedded_dropout(embed, words, dropout=0.1, scale=None):
     padding_idx = embed.padding_idx
     if padding_idx is None:
         padding_idx = -1
-    X = embed._backend.Embedding.apply(words, masked_embed_weight,
-        padding_idx, embed.max_norm, embed.norm_type,
-        embed.scale_grad_by_freq, embed.sparse
-    )
+    X = nn.functional.embedding(
+        words, masked_embed_weight, padding_idx, embed.max_norm,
+        embed.norm_type, embed.scale_grad_by_freq, embed.sparse)
     return X
 
 
@@ -78,16 +78,20 @@ class LockedDropout(nn.Module):
     def forward(self, x, dropout=0.5):
         if not self.training or not dropout:
             return x
-        m = x.data.new(1, x.size(1), x.size(2)).bernoulli_(1 - dropout)
-        mask = Variable(m.div_(1 - dropout), requires_grad=False)
+        m = x.new_empty(1, x.size(1), x.size(2)).bernoulli_(1 - dropout)
+        mask = m.div_(1 - dropout)
         mask = mask.expand_as(x)
         return mask * x
 
 
-def mask2d(B, D, keep_prob, cuda=True):
-    m = torch.floor(torch.rand(B, D) + keep_prob) / keep_prob
-    m = Variable(m, requires_grad=False)
-    if cuda:
-        m = m.cuda()
-    return m
+def mask2d(B, D, keep_prob, device=None):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.floor(torch.rand(B, D, device=device) + keep_prob) / keep_prob
 
+
+def safe_torch_load(path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)

@@ -1,20 +1,39 @@
 import torch
 import numpy as np
-import torch.nn as nn
+
+from cost_utils import expected_cost
 
 
 def _concat(xs):
   return torch.cat([x.reshape(-1) for x in xs])
 
 
-class Architect(object):
+class ArchitectCG(object):
 
-  def __init__(self, model, args):
+  def __init__(self, model, args, cost_normal, cost_reduce):
     self.network_momentum = args.momentum
     self.network_weight_decay = args.weight_decay
     self.model = model
+    device = next(model.parameters()).device
+    self.cost_normal = cost_normal.to(device)
+    self.cost_reduce = cost_reduce.to(device)
+    self.cost_weight = 0.0
     self.optimizer = torch.optim.Adam(self.model.arch_parameters(),
         lr=args.arch_learning_rate, betas=(0.5, 0.999), weight_decay=args.arch_weight_decay)
+
+  def set_cost_weight(self, cost_weight):
+    self.cost_weight = float(cost_weight)
+
+  def cost_value(self, model=None):
+    model = self.model if model is None else model
+    return expected_cost(model, self.cost_normal, self.cost_reduce)
+
+  def _arch_loss(self, model, input, target):
+    val_loss = model._loss(input, target)
+    cost = self.cost_value(model)
+    if self.cost_weight == 0.0:
+      return val_loss, val_loss, cost
+    return val_loss + self.cost_weight * cost, val_loss, cost
 
   def _compute_unrolled_model(self, input, target, eta, network_optimizer):
     loss = self.model._loss(input, target)
@@ -40,12 +59,12 @@ class Architect(object):
     self.optimizer.step()
 
   def _backward_step(self, input_valid, target_valid):
-    loss = self.model._loss(input_valid, target_valid)
+    loss, _, _ = self._arch_loss(self.model, input_valid, target_valid)
     loss.backward()
 
   def _backward_step_unrolled(self, input_train, target_train, input_valid, target_valid, eta, network_optimizer):
     unrolled_model = self._compute_unrolled_model(input_train, target_train, eta, network_optimizer)
-    unrolled_loss = unrolled_model._loss(input_valid, target_valid)
+    unrolled_loss, _, _ = self._arch_loss(unrolled_model, input_valid, target_valid)
 
     unrolled_loss.backward()
     dalpha = [

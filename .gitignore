@@ -103,6 +103,14 @@ search-*/
 eval-*/
 runs/
 
+# Datasets and generated training artifacts
+data/
+cnn/data/
+*.tar.gz
+*.pt
+*.pth
+*.ckpt
+
 # Swap
 [._]*.s[a-v][a-z]
 [._]*.sw[a-p]
