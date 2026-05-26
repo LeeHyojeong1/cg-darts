@@ -33,6 +33,10 @@ case "${TASK}" in
     shift
     ./scripts/run_params_pipeline.sh "$@"
     ;;
+  cnn-cg-device)
+    shift
+    ./scripts/run_device_pipeline.sh "$@"
+    ;;
   cnn-train)
     shift
     cd cnn

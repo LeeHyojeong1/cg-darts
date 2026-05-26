@@ -16,6 +16,7 @@ import torch.backends.cudnn as cudnn
 from model_search import Network
 from architect_cg import ArchitectCG
 from cost_utils import build_search_costs
+from device_profiles import get_device_profile
 
 
 parser = argparse.ArgumentParser("cifar")
@@ -45,8 +46,12 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--cost_metric', type=str, default='flops', choices=['flops', 'params'],
+parser.add_argument('--cost_metric', type=str, default='flops',
+                    choices=['flops', 'params', 'mem', 'device'],
                     help='differentiable architecture cost metric')
+parser.add_argument('--device', type=str, default='',
+                    choices=['', 'jetson_orin', 'rtx_pro_6000', 'h100'],
+                    help='target hardware profile for metric=device')
 parser.add_argument('--cost_lambda', type=float, default=0.0,
                     help='weight for the architecture cost regularizer')
 parser.add_argument('--cost_warmup_epochs', type=int, default=0,
@@ -144,10 +149,24 @@ def main():
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
+  if args.cost_metric == 'device':
+    if not args.device:
+      raise ValueError('--device is required when --cost_metric device')
+  elif args.device:
+    logging.info('ignoring --device because cost_metric=%s', args.cost_metric)
+
+  device_profile = None
+  if args.cost_metric == 'device':
+    device_profile = get_device_profile(args.device)
+    logging.info('device profile = %s (%s)', device_profile.name, device_profile.label)
+    logging.info('device peak_tflops=%.2f mem_bw=%.1f GB/s weights=(%.2f, %.2f, %.2f)',
+                 device_profile.peak_tflops_fp32, device_profile.mem_bandwidth_gbps,
+                 device_profile.w_flops, device_profile.w_mem, device_profile.w_lat)
+
   costs = build_search_costs(
       args.init_channels, args.layers, steps=model._steps,
       input_size=args.cost_input_size, metric=args.cost_metric,
-      normalize=args.cost_normalize)
+      normalize=args.cost_normalize, device_profile=device_profile)
   logging.info('cost metric = %s normalize = %s lambda = %e warmup_epochs = %d',
                args.cost_metric, args.cost_normalize, args.cost_lambda, args.cost_warmup_epochs)
   logging.info('raw normal cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.normal_raw))
