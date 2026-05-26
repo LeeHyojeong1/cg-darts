@@ -42,5 +42,13 @@ Retrain searched architecture:
 Generate result summary/plots:
 
     python scripts/cg_darts_report.py
+    python scripts/plot_from_summary.py   # CSV-only plots
 
 Results are saved under `reports/cg_darts/`.
+
+Full reproduction (2 GPUs, search + retrain + report):
+
+    ./scripts/run_parallel_pipeline.sh
+    tail -f logs/pipeline.log
+
+See `PROJECT_STATUS.md` for experiment progress.

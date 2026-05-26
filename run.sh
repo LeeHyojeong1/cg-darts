@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CUDA_VISIBLE_DEVICES=1
-PYTHON_BIN="${PYTHON_BIN:-/home/members/hyojeong/anaconda3/bin/conda run -n hj python}"
+# Override to pin GPUs, e.g. CUDA_VISIBLE_DEVICES=0 ./run.sh ...
+: "${CUDA_VISIBLE_DEVICES:=0}"
+export CUDA_VISIBLE_DEVICES
+PYTHON_BIN="${PYTHON_BIN:-/home/members/ryeowook/miniconda3/bin/python}"
 TASK="${1:-}"
 
 case "${TASK}" in
@@ -27,6 +29,10 @@ case "${TASK}" in
     shift
     ./run_cg_sweep.sh "$@"
     ;;
+  cnn-cg-params)
+    shift
+    ./scripts/run_params_pipeline.sh "$@"
+    ;;
   cnn-train)
     shift
     cd cnn
@@ -48,6 +54,7 @@ Usage:
   ./run.sh cnn-search-select --data ./data --download --gpu 0 --unrolled
   ./run.sh cnn-cg-search --data ./data --download --gpu 0 --cost_lambda 1e-2
   LAMBDAS="0 1e-3 5e-3 1e-2" ./run.sh cnn-cg-sweep --batch_size 64
+  ./run.sh cnn-cg-params
   ./run.sh rnn-search-select --data ./data/penn --gpu 0 --unrolled
   ./run.sh cnn-search --data ./data --download --gpu 0 --unrolled
   ./run.sh cnn-train --data ./data --download --gpu 0

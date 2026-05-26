@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/members/hyojeong/anaconda3/bin/conda run -n hj python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/members/ryeowook/miniconda3/bin/python}"
 DATA="${DATA:-${ROOT_DIR}/data}"
 GPU="${GPU:-0}"
 EPOCHS="${EPOCHS:-50}"

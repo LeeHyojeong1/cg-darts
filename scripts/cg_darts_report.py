@@ -23,52 +23,63 @@ from model_search import Network as SearchNetwork  # noqa: E402
 CIFAR_CLASSES = 10
 INPUT_SIZE = 32
 REPORT_DIR = ROOT / "reports" / "cg_darts"
+DEFAULT_LAMBDAS = ["1e-3", "5e-3", "1e-2", "5e-2", "1e-1"]
 
 
-EXPERIMENTS = [
-  {
-    "method": "Vanilla",
-    "lambda": "",
-    "lambda_value": None,
-    "search_dir": CNN_DIR / "search-first-order-50ep-20260517-222002",
-    "eval_dir": CNN_DIR / "eval-eval-vanilla-seed2-100ep-20260518-185929",
-  },
-  {
-    "method": "CG-DARTS",
-    "lambda": "1e-3",
-    "lambda_value": 1e-3,
-    "search_dir": CNN_DIR / "search-cg-cg-flops-lambda1em3-seed2-20260517-233128",
-    "eval_dir": None,
-  },
-  {
-    "method": "CG-DARTS",
-    "lambda": "5e-3",
-    "lambda_value": 5e-3,
-    "search_dir": CNN_DIR / "search-cg-cg-flops-lambda5em3-seed2-20260518-060004",
-    "eval_dir": None,
-  },
-  {
-    "method": "CG-DARTS",
-    "lambda": "1e-2",
-    "lambda_value": 1e-2,
-    "search_dir": CNN_DIR / "search-cg-cg-flops-lambda1em2-seed2-20260518-105325",
-    "eval_dir": CNN_DIR / "eval-eval-cg-lambda1e-2-seed2-100ep-20260519-004022",
-  },
-  {
-    "method": "CG-DARTS",
-    "lambda": "5e-2",
-    "lambda_value": 5e-2,
-    "search_dir": CNN_DIR / "search-cg-cg-flops-lambda5em2-seed2-20260518-110057",
-    "eval_dir": CNN_DIR / "eval-eval-cg-lambda5e-2-seed2-100ep-20260519-004055",
-  },
-  {
-    "method": "CG-DARTS",
-    "lambda": "1e-1",
-    "lambda_value": 1e-1,
-    "search_dir": CNN_DIR / "search-cg-cg-flops-lambda1em1-seed2-20260518-183936",
-    "eval_dir": None,
-  },
-]
+def _newest_dir(parent, prefix):
+  matches = sorted(
+    (p for p in parent.iterdir() if p.is_dir() and p.name.startswith(prefix)),
+    key=lambda p: p.stat().st_mtime,
+    reverse=True)
+  return matches[0] if matches else None
+
+
+def _lambda_token(lmbda):
+  token = lmbda.replace(".", "p").replace("-", "m").replace("+", "p")
+  return "lambda{}".format(token)
+
+
+def _find_eval_dir(search_dir):
+  suffix = search_dir.name[len("search-"):] if search_dir.name.startswith("search-") else search_dir.name
+  for prefix in ("eval-eval-{}", "eval-{}", "eval-eval-eval-{}"):
+    found = _newest_dir(CNN_DIR, prefix.format(suffix))
+    if found is not None:
+      return found
+  return None
+
+
+def discover_experiments(lambdas=None, cost_metric="flops", include_vanilla=True):
+  lambdas = DEFAULT_LAMBDAS if lambdas is None else lambdas
+  experiments = []
+
+  if include_vanilla:
+    vanilla = _newest_dir(CNN_DIR, "search-first-order-")
+    if vanilla is not None and (vanilla / "weights.pt").exists():
+      experiments.append({
+        "method": "Vanilla",
+        "lambda": "",
+        "lambda_value": None,
+        "search_dir": vanilla,
+        "eval_dir": _find_eval_dir(vanilla),
+      })
+
+  for lmbda in lambdas:
+    token = _lambda_token(lmbda)
+    search_dir = _newest_dir(CNN_DIR, "search-cg-cg-{}-{}".format(cost_metric, token))
+    if search_dir is None:
+      search_dir = _newest_dir(CNN_DIR, "search-cg-cg-flops-{}".format(token))
+    if search_dir is None:
+      search_dir = _newest_dir(CNN_DIR, "search-cg-{}".format(token))
+    if search_dir is None:
+      continue
+    experiments.append({
+      "method": "CG-DARTS",
+      "lambda": lmbda,
+      "lambda_value": float(lmbda),
+      "search_dir": search_dir,
+      "eval_dir": _find_eval_dir(search_dir),
+    })
+  return experiments
 
 
 def read_last_cost_log(path):
@@ -95,13 +106,19 @@ def read_genotype(path):
   return eval(text, {"Genotype": genotypes.Genotype, "range": range})
 
 
-def vanilla_expected_cost(search_dir):
+def vanilla_expected_cost(search_dir, metric="flops"):
   criterion = nn.CrossEntropyLoss()
   model = SearchNetwork(16, CIFAR_CLASSES, 8, criterion)
-  state = torch.load(str(search_dir / "weights.pt"), map_location="cpu")
+  weights_path = search_dir / "weights.pt"
+  if not weights_path.exists():
+    raise FileNotFoundError(weights_path)
+  try:
+    state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+  except TypeError:
+    state = torch.load(str(weights_path), map_location="cpu")
   model.load_state_dict(state)
   costs = build_search_costs(
-    16, 8, steps=model._steps, input_size=INPUT_SIZE, metric="flops", normalize="edge")
+    16, 8, steps=model._steps, input_size=INPUT_SIZE, metric=metric, normalize="edge")
   return float(expected_cost(model, costs.normal, costs.reduce))
 
 
@@ -256,17 +273,45 @@ def plot_results(rows, histories):
 
 
 def main():
+  import argparse
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--cost-metric", default="flops", choices=["flops", "params"])
+  parser.add_argument("--report-dir", default=None)
+  parser.add_argument("--lambdas", nargs="+", default=None,
+                      help="lambda values to include (default: all for flops, 1e-2 5e-2 for params)")
+  parser.add_argument("--skip-vanilla", action="store_true",
+                      help="do not include vanilla baseline even if weights exist")
+  args_cli = parser.parse_args()
+
+  global REPORT_DIR
+  if args_cli.report_dir:
+    REPORT_DIR = Path(args_cli.report_dir)
+  elif args_cli.cost_metric == "params":
+    REPORT_DIR = ROOT / "reports" / "cg_darts_params"
   REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+  lambdas = args_cli.lambdas
+  if lambdas is None and args_cli.cost_metric == "params":
+    lambdas = ["1e-2", "5e-2"]
+
+  experiments = discover_experiments(
+    lambdas=lambdas,
+    cost_metric=args_cli.cost_metric,
+    include_vanilla=not args_cli.skip_vanilla)
+  if not experiments:
+    raise SystemExit(
+      "No search-* experiment directories found under {} for metric={}. "
+      "Run ./scripts/run_params_pipeline.sh first.".format(CNN_DIR, args_cli.cost_metric))
 
   rows = []
   histories = {}
   vanilla_cost = None
 
-  for exp in EXPERIMENTS:
+  for exp in experiments:
     label = exp["method"] if not exp["lambda"] else "lambda={}".format(exp["lambda"])
     search_dir = exp["search_dir"]
     if exp["method"] == "Vanilla":
-      expected = vanilla_expected_cost(search_dir)
+      expected = vanilla_expected_cost(search_dir, metric=args_cli.cost_metric)
       search_acc = last_metric(search_dir / "log.txt", r"valid_acc ([0-9.]+)")
       histories[label] = []
       vanilla_cost = expected
