@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 
 import torch
@@ -86,7 +87,19 @@ def _normalize(cost, mode):
   raise ValueError('Unsupported normalization mode: {}'.format(mode))
 
 
-def build_search_costs(init_channels, layers, steps=4, input_size=32, metric='flops', normalize='edge'):
+def _load_lut(lut_path):
+  with open(lut_path) as f:
+    data = json.load(f)
+  primitives = data['meta'].get('primitives', PRIMITIVES)
+  if primitives != PRIMITIVES:
+    raise ValueError('LUT primitive order mismatch: {} vs {}'.format(primitives, PRIMITIVES))
+  normal = torch.tensor(data['normal'], dtype=torch.float32)
+  reduce = torch.tensor(data['reduce'], dtype=torch.float32)
+  return normal, reduce
+
+
+def build_search_costs(init_channels, layers, steps=4, input_size=32, metric='flops',
+                       normalize='edge', lut_path=None):
   """Build alpha-shaped cost lookup tables for DARTS CNN search.
 
   The returned tensors have shape [num_edges, num_ops], matching
@@ -94,9 +107,22 @@ def build_search_costs(init_channels, layers, steps=4, input_size=32, metric='fl
   tensor over all normal cells and one reduce alpha tensor over all reduction
   cells, each entry sums the cost of using that edge/op choice at every cell
   position of the corresponding type in the search network.
+
+  metric='lut' consumes a JSON file produced by
+  `scripts/measure_latency_lut.py` so the search uses *measured* per-primitive
+  latency rather than an analytical FLOPs/params count.
   """
+  if metric == 'lut':
+    if lut_path is None:
+      raise ValueError('metric=lut requires lut_path')
+    normal_raw, reduce_raw = _load_lut(lut_path)
+    normal = _normalize(normal_raw, normalize)
+    reduce = _normalize(reduce_raw, normalize)
+    return CostTensors(normal=normal, reduce=reduce,
+                       normal_raw=normal_raw.clone(), reduce_raw=reduce_raw.clone())
+
   if metric not in ('flops', 'params'):
-    raise ValueError('metric must be one of: flops, params')
+    raise ValueError('metric must be one of: flops, params, lut')
 
   edge_specs = _edge_specs(steps)
   normal = torch.zeros(len(edge_specs), len(PRIMITIVES), dtype=torch.float32)
@@ -130,6 +156,7 @@ def build_search_costs(init_channels, layers, steps=4, input_size=32, metric='fl
 
 
 def expected_cost(model, cost_normal, cost_reduce):
-  normal_prob = F.softmax(model.alphas_normal, dim=-1)
-  reduce_prob = F.softmax(model.alphas_reduce, dim=-1)
+  tau = getattr(model, 'tau', 1.0) or 1.0
+  normal_prob = F.softmax(model.alphas_normal / tau, dim=-1)
+  reduce_prob = F.softmax(model.alphas_reduce / tau, dim=-1)
   return (normal_prob * cost_normal).sum() + (reduce_prob * cost_reduce).sum()

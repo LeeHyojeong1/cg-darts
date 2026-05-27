@@ -92,6 +92,7 @@ class Network(nn.Module):
     self.global_pooling = nn.AdaptiveAvgPool2d(1)
     self.classifier = nn.Linear(C_prev, num_classes)
 
+    self.tau = 1.0  # softmax temperature for the mixed-op forward pass; train script may anneal this
     self._use_batch_specific_bn_stats()
     self._initialize_alphas()
 
@@ -101,17 +102,19 @@ class Network(nn.Module):
       self._C, self._num_classes, self._layers, self._criterion,
       self._steps, self._multiplier, self._stem_multiplier
     ).to(device)
+    model_new.tau = self.tau
     for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
         x.data.copy_(y.data)
     return model_new
 
   def forward(self, input):
     s0 = s1 = self.stem(input)
+    tau = self.tau if self.tau and self.tau > 0 else 1.0
     for i, cell in enumerate(self.cells):
       if cell.reduction:
-        weights = F.softmax(self.alphas_reduce, dim=-1)
+        weights = F.softmax(self.alphas_reduce / tau, dim=-1)
       else:
-        weights = F.softmax(self.alphas_normal, dim=-1)
+        weights = F.softmax(self.alphas_normal / tau, dim=-1)
       s0, s1 = s1, cell(s0, s1, weights)
     out = self.global_pooling(s1)
     logits = self.classifier(out.view(out.size(0),-1))
@@ -152,29 +155,62 @@ class Network(nn.Module):
   def weight_parameters(self):
     return [param for _, param in self.named_weight_parameters()]
 
-  def genotype(self):
+  def genotype(self, cost_normal=None, cost_reduce=None, mode='argmax', cost_weight=0.0,
+               cost_eps=1e-6, tau=1.0):
+    """Derive a discrete genotype from the architecture parameters.
 
-    def _parse(weights):
+    Modes (slide-16 open question: performance-aware architecture derivation):
+      - 'argmax'   : original DARTS — pick top-2 incoming edges by max non-none op weight, op = argmax.
+      - 'cost_sub' : score(j,k) = softmax(alpha)[j,k] - cost_weight * cost_norm[j,k].
+      - 'cost_div' : score(j,k) = softmax(alpha)[j,k] / (cost_eps + cost_norm[j,k]).
+
+    `tau` rescales alpha before softmax for annealing-aware derivation.
+    `cost_normal`/`cost_reduce` are alpha-shaped [num_edges, num_ops] cost tables.
+    """
+    none_idx = PRIMITIVES.index('none')
+
+    def _scores(weights, costs):
+      if mode == 'argmax' or costs is None:
+        return weights
+      if mode == 'cost_sub':
+        return weights - cost_weight * costs
+      if mode == 'cost_div':
+        return weights / (cost_eps + costs)
+      raise ValueError('Unsupported discretize mode: {}'.format(mode))
+
+    def _parse(weights, costs):
       gene = []
       n = 2
       start = 0
       for i in range(self._steps):
         end = start + n
         W = weights[start:end].copy()
-        edges = sorted(range(i + 2), key=lambda x: -max(W[x][k] for k in range(len(W[x])) if k != PRIMITIVES.index('none')))[:2]
+        C = costs[start:end].copy() if costs is not None else None
+        S = _scores(W, C) if mode != 'argmax' else W
+        edges = sorted(
+            range(i + 2),
+            key=lambda x: -max(S[x][k] for k in range(len(S[x])) if k != none_idx)
+        )[:2]
         for j in edges:
           k_best = None
           for k in range(len(W[j])):
-            if k != PRIMITIVES.index('none'):
-              if k_best is None or W[j][k] > W[j][k_best]:
-                k_best = k
+            if k == none_idx:
+              continue
+            score = S[j][k]
+            if k_best is None or score > S[j][k_best]:
+              k_best = k
           gene.append((PRIMITIVES[k_best], j))
         start = end
         n += 1
       return gene
 
-    gene_normal = _parse(F.softmax(self.alphas_normal, dim=-1).data.cpu().numpy())
-    gene_reduce = _parse(F.softmax(self.alphas_reduce, dim=-1).data.cpu().numpy())
+    soft_normal = F.softmax(self.alphas_normal / tau, dim=-1).data.cpu().numpy()
+    soft_reduce = F.softmax(self.alphas_reduce / tau, dim=-1).data.cpu().numpy()
+    cn = None if cost_normal is None else cost_normal.detach().cpu().numpy()
+    cr = None if cost_reduce is None else cost_reduce.detach().cpu().numpy()
+
+    gene_normal = _parse(soft_normal, cn)
+    gene_reduce = _parse(soft_reduce, cr)
 
     concat = range(2+self._steps-self._multiplier, self._steps+2)
     genotype = Genotype(

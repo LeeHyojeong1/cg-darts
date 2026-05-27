@@ -45,8 +45,11 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--cost_metric', type=str, default='flops', choices=['flops', 'params'],
+parser.add_argument('--cost_metric', type=str, default='flops',
+                    choices=['flops', 'params', 'lut'],
                     help='differentiable architecture cost metric')
+parser.add_argument('--lut_path', type=str, default='',
+                    help='path to a latency LUT JSON when cost_metric=lut')
 parser.add_argument('--cost_lambda', type=float, default=0.0,
                     help='weight for the architecture cost regularizer')
 parser.add_argument('--cost_warmup_epochs', type=int, default=0,
@@ -55,6 +58,17 @@ parser.add_argument('--cost_normalize', type=str, default='edge', choices=['edge
                     help='normalization mode for operation costs')
 parser.add_argument('--cost_input_size', type=int, default=32,
                     help='input image size used for FLOPs lookup construction')
+parser.add_argument('--tau_start', type=float, default=1.0,
+                    help='initial softmax temperature for the mixed-op forward pass')
+parser.add_argument('--tau_end', type=float, default=1.0,
+                    help='final softmax temperature; linearly annealed from tau_start')
+parser.add_argument('--tau_anneal', type=str, default='linear', choices=['linear', 'exp', 'none'],
+                    help='temperature anneal schedule between tau_start and tau_end')
+parser.add_argument('--discretize_mode', type=str, default='argmax',
+                    choices=['argmax', 'cost_sub', 'cost_div'],
+                    help='derivation strategy used to convert alpha into a discrete genotype')
+parser.add_argument('--discretize_cost_weight', type=float, default=1.0,
+                    help='mu for discretize_mode=cost_sub: score = softmax(alpha) - mu * cost_norm')
 args = parser.parse_args()
 
 args.save = 'search-cg-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
@@ -82,6 +96,22 @@ def scheduled_lambda(epoch):
     return args.cost_lambda
   scale = min(1.0, float(epoch + 1) / float(args.cost_warmup_epochs))
   return args.cost_lambda * scale
+
+
+def scheduled_tau(epoch):
+  if args.tau_anneal == 'none' or args.epochs <= 1:
+    return args.tau_start
+  progress = float(epoch) / float(args.epochs - 1)
+  progress = max(0.0, min(1.0, progress))
+  if args.tau_anneal == 'linear':
+    return args.tau_start + progress * (args.tau_end - args.tau_start)
+  if args.tau_anneal == 'exp':
+    # exponential interpolation requires positive tau values
+    start = max(args.tau_start, 1e-3)
+    end = max(args.tau_end, 1e-3)
+    import math
+    return start * math.exp(progress * math.log(end / start))
+  return args.tau_start
 
 
 def tensor_range(tensor):
@@ -144,10 +174,13 @@ def main():
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
+  if args.cost_metric == 'lut' and not args.lut_path:
+    raise ValueError('--cost_metric lut requires --lut_path')
   costs = build_search_costs(
       args.init_channels, args.layers, steps=model._steps,
       input_size=args.cost_input_size, metric=args.cost_metric,
-      normalize=args.cost_normalize)
+      normalize=args.cost_normalize,
+      lut_path=(args.lut_path or None))
   logging.info('cost metric = %s normalize = %s lambda = %e warmup_epochs = %d',
                args.cost_metric, args.cost_normalize, args.cost_lambda, args.cost_warmup_epochs)
   logging.info('raw normal cost min/max/mean = %.6e %.6e %.6e', *tensor_range(costs.normal_raw))
@@ -158,16 +191,26 @@ def main():
   architect = ArchitectCG(model, args, costs.normal, costs.reduce)
   cost_log_path = os.path.join(args.save, 'cost_log.csv')
   with open(cost_log_path, 'w') as f:
-    f.write('epoch,lambda,expected_cost,train_acc,train_obj,valid_acc,valid_obj\n')
+    f.write('epoch,lambda,tau,expected_cost,train_acc,train_obj,valid_acc,valid_obj\n')
+  logging.info('tau schedule = %s start=%f end=%f', args.tau_anneal, args.tau_start, args.tau_end)
+  logging.info('discretize mode = %s cost_weight = %f', args.discretize_mode, args.discretize_cost_weight)
 
   for epoch in range(args.epochs):
     lr = scheduler.get_last_lr()[0]
     lambda_t = scheduled_lambda(epoch)
     architect.set_cost_weight(lambda_t)
-    logging.info('epoch %d lr %e', epoch, lr)
+    tau_t = scheduled_tau(epoch)
+    model.tau = tau_t
+    logging.info('epoch %d lr %e tau %e', epoch, lr, tau_t)
     logging.info('cg lambda %e expected_%s %e', lambda_t, args.cost_metric, current_cost(architect))
 
-    genotype = model.genotype()
+    genotype = model.genotype(
+      cost_normal=architect.cost_normal,
+      cost_reduce=architect.cost_reduce,
+      mode=args.discretize_mode,
+      cost_weight=args.discretize_cost_weight,
+      tau=tau_t,
+    )
     logging.info('genotype = %s', genotype)
     save_genotype(genotype, args.save)
 
@@ -185,8 +228,8 @@ def main():
     expected_cost = current_cost(architect)
     logging.info('expected_%s %e', args.cost_metric, expected_cost)
     with open(cost_log_path, 'a') as f:
-      f.write('{},{:.8e},{:.8e},{:.8f},{:.8e},{:.8f},{:.8e}\n'.format(
-        epoch, lambda_t, expected_cost, train_acc, train_obj, valid_acc, valid_obj))
+      f.write('{},{:.8e},{:.8e},{:.8e},{:.8f},{:.8e},{:.8f},{:.8e}\n'.format(
+        epoch, lambda_t, tau_t, expected_cost, train_acc, train_obj, valid_acc, valid_obj))
 
     utils.save(model, os.path.join(args.save, 'weights.pt'))
     scheduler.step()
