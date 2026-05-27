@@ -19,10 +19,31 @@ DEVICES=(${DEVICES:-jetson_orin rtx_pro_6000 h100})
 SKIP_SEARCH="${SKIP_SEARCH:-0}"
 SKIP_RETRAIN="${SKIP_RETRAIN:-0}"
 
+lambda_token() {
+  local lmbda="$1"
+  echo "lambda${lmbda//./p}"
+}
+
+newest_search_dir() {
+  local device="$1"
+  local lmbda="$2"
+  local token dir
+  token="$(lambda_token "${lmbda}")"
+  for dir in $(ls -dt "${ROOT_DIR}/cnn"/search-cg-device-"${device}"-"${token}"* 2>/dev/null); do
+    if [[ -f "${dir}/genotype.txt" && -f "${dir}/weights.pt" ]]; then
+      echo "${dir}"
+      return 0
+    fi
+  done
+  ls -dt "${ROOT_DIR}/cnn"/search-cg-device-"${device}"-"${token}"* 2>/dev/null | head -1
+}
+
 run_search() {
   local gpu="$1"
   local device="$2"
   local lmbda="$3"
+  local token
+  token="$(lambda_token "${lmbda}")"
   cd "${ROOT_DIR}/cnn"
   echo "[$(date)] GPU${gpu} device=${device} lambda=${lmbda} epochs=${EPOCHS}"
   CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON_BIN}" train_search_cg.py \
@@ -36,15 +57,7 @@ run_search() {
     --cost_lambda "${lmbda}" \
     --cost_warmup_epochs "${WARMUP}" \
     --cost_normalize edge \
-    --save "device-${device}-lambda${lmbda//./p}-seed${SEED}"
-}
-
-newest_search_dir() {
-  local device="$1"
-  local lmbda="$2"
-  local token="lambda${lmbda//./p}"
-  token="${token//-/m}"
-  ls -dt "${ROOT_DIR}/cnn"/search-cg-device-"${device}"-"${token}"* 2>/dev/null | head -1
+    --save "device-${device}-${token}-seed${SEED}"
 }
 
 run_retrain() {
@@ -96,18 +109,25 @@ fi
 
 if [[ "${SKIP_RETRAIN}" != "1" ]]; then
   idx=0
+  pids=()
   for device in "${DEVICES[@]}"; do
     for lmbda in "${LAMBDAS[@]}"; do
       gpu=$((idx % 2))
       log="${LOG_DIR}/device_retrain_${device}_lambda${lmbda//./p}.log"
       run_retrain "${gpu}" "${device}" "${lmbda}" > "${log}" 2>&1 &
+      pids+=("$!")
       idx=$((idx + 1))
       if (( idx % 2 == 0 )); then
-        wait
+        for pid in "${pids[@]}"; do
+          wait "${pid}" || exit 1
+        done
+        pids=()
       fi
     done
   done
-  wait
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || exit 1
+  done
   echo "[$(date)] Retrain done"
 fi
 
