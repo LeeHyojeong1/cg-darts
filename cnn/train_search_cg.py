@@ -62,8 +62,11 @@ parser.add_argument('--tau_start', type=float, default=1.0,
                     help='initial softmax temperature for the mixed-op forward pass')
 parser.add_argument('--tau_end', type=float, default=1.0,
                     help='final softmax temperature; linearly annealed from tau_start')
-parser.add_argument('--tau_anneal', type=str, default='linear', choices=['linear', 'exp', 'none'],
+parser.add_argument('--tau_anneal', type=str, default='linear',
+                    choices=['linear', 'exp', 'none', 'hold_then_cosine'],
                     help='temperature anneal schedule between tau_start and tau_end')
+parser.add_argument('--tau_hold_fraction', type=float, default=0.8,
+                    help='fraction of epochs to hold tau=tau_start before annealing (hold_then_cosine only)')
 parser.add_argument('--discretize_mode', type=str, default='argmax',
                     choices=['argmax', 'cost_sub', 'cost_div'],
                     help='derivation strategy used to convert alpha into a discrete genotype')
@@ -106,11 +109,19 @@ def scheduled_tau(epoch):
   if args.tau_anneal == 'linear':
     return args.tau_start + progress * (args.tau_end - args.tau_start)
   if args.tau_anneal == 'exp':
-    # exponential interpolation requires positive tau values
     start = max(args.tau_start, 1e-3)
     end = max(args.tau_end, 1e-3)
     import math
     return start * math.exp(progress * math.log(end / start))
+  if args.tau_anneal == 'hold_then_cosine':
+    import math
+    hold = max(0.0, min(1.0, args.tau_hold_fraction))
+    if progress <= hold:
+      return args.tau_start
+    # cosine descent from tau_start to tau_end over the remaining fraction
+    local = (progress - hold) / max(1e-9, 1.0 - hold)
+    cos = 0.5 * (1.0 + math.cos(math.pi * local))  # 1 → 0
+    return args.tau_end + (args.tau_start - args.tau_end) * cos
   return args.tau_start
 
 
